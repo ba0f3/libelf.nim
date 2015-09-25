@@ -16,6 +16,8 @@
 ## typedef __u64   Elf64_Xword;
 ## typedef __s64   Elf64_Sxword;
 
+import posix, pegs, strutils, ../ptrace/ptrace/ptrace
+
 const
   PT_NULL* = 0
   PT_LOAD* = 1
@@ -83,6 +85,165 @@ const
   OLD_DT_HIOS* = 0x6fffffff
   DT_LOPROC* = 0x70000000
   DT_HIPROC* = 0x7fffffff
+  DT_GNU_HASH* = 0x6ffffef5
+
+  STT_NOTYPE* = 0
+  STT_OBJECT* = 1
+  STT_FUNC* = 2
+  STT_SECTION* = 3
+  STT_FILE* = 4
+  STT_COMMON* = 5
+  STT_TLS* = 6
+  STT_NUM* = 7
+  STT_LOOS* = 10
+  STT_GNU_IFUNC* = 10
+  STT_HIOS* = 12
+  STT_LOPROC* = 13
+  STT_HIPROC* = 15
 
 include private/elf32
 include private/elf64
+
+
+when hostCPU == "i386":
+  type
+    Elf_Ehdr = Elf32_Ehdr
+    Elf_Phdr = Elf32_Phdr
+    Elf_Dyn = Elf32_Dyn
+    Elf_Sym = Elf32_Sym
+else:
+  type
+    Elf_Ehdr = Elf64_Ehdr
+    Elf_Phdr = Elf64_Phdr
+    Elf_Dyn = Elf64_Dyn
+    Elf_Sym = Elf64_Sym
+
+type
+  LinkMap* = object
+    l_addr*: cuint
+    l_name*: cstring
+    l_ld*: ptr Elf_Dyn
+    l_next*: ptr LinkMap
+    l_prev*: ptr LinkMap
+
+
+let
+  freeSpaceEntry = peg(r"{\w+}'-'(\w+)\s[rwxp-]+\s\d+\s'00:00'")
+  elfHeaderAddress: clong = 0x08048000
+
+var
+  nchains: clong
+  symtab, strtab: culong
+
+proc getFreeSpaceAddr*(p: int): int =
+  var
+    fp: File
+    filename = "/proc/" & $p & "/maps"
+    line: string
+
+  fp = open(filename, fmRead)
+  if fp.isNil:
+    raise newException(IOError, "Unable to open " & filename & " for reading")
+
+  while not endOfFile(fp):
+    line = readLine(fp)
+    echo line
+    if line =~ freeSpaceEntry:
+      result = parseHexInt(matches[0])
+      break
+  close(fp)
+
+proc getLinkMap*(p: int): LinkMap =
+  var
+    ehdr: Elf_Ehdr
+    phdr: Elf_Phdr
+    dyn: Elf_Dyn
+    got: uint32
+    phdr_addr, dyn_addr, map_addr: clong
+
+  attach(p)
+
+  getData(p, elfHeaderAddress, addr ehdr, sizeof(ehdr))
+
+  phdr_addr = elfHeaderAddress + ehdr.e_phoff.clong
+  getData(p, phdr_addr, addr phdr, sizeof(phdr))
+
+  while phdr.p_type != PT_DYNAMIC:
+    phdr_addr.inc(sizeof(phdr))
+    getData(p, phdr_addr, addr phdr, sizeof(phdr))
+
+  getData(p, phdr.p_vaddr.clong, addr dyn, sizeof(dyn))
+  dyn_addr = phdr.p_vaddr.clong
+
+
+  while dyn.d_tag != DT_PLTGOT:
+    dyn_addr = dyn_addr + sizeof(dyn)
+    getData(p, dyn_addr, addr dyn, sizeof(dyn))
+
+  got = dyn.d_un.d_ptr
+  inc(got, WORD_SIZE)
+
+  map_addr = getData(p, got.clong)
+
+  getData(p, map_addr, addr result, sizeof(LinkMap))
+  discard detach(p)
+
+proc getSymInfo*(p: Pid, map: LinkMap) =
+  var
+    dyn: Elf_Dyn
+    dyn_addr: clong
+
+  dyn_addr = cast[clong](map.l_ld)
+
+  attach(p)
+  getData(p, dyn_addr, addr dyn, sizeof(dyn))
+
+  while dyn.d_tag != DT_NULL:
+    if dyn.d_tag == DT_SYMTAB:
+      symtab = dyn.d_un.d_ptr
+    elif dyn.d_tag == DT_STRTAB:
+      strtab = dyn.d_un.d_ptr
+    elif dyn.d_tag == DT_GNU_HASH:
+      nchains = getData(p, clong(dyn.d_un.d_ptr + map.l_addr + WORD_SIZE))
+    else:
+      discard
+
+    dyn_addr.inc(sizeof(Elf_Dyn))
+    getData(p, dyn_addr, addr dyn, sizeof(dyn))
+
+  detach(p)
+
+proc findSym*(p: Pid, map: LinkMap, name: cstring): culong =
+  result = 0
+  var
+    sym: Elf_Sym
+    str: string
+  echo nchains
+  attach(p)
+  for i in 0..nchains-1:
+
+    getData(p, symtab.clong + clong(i * sizeof(Elf_Sym)), addr sym, sizeof(sym))
+
+    str = getString(p, clong(strtab + sym.st_name))
+    echo str
+    if sym.st_info.int != STT_FUNC:
+      continue
+
+
+    echo str
+    if str == name:
+      result = map.l_addr + sym.st_value
+      break
+  discard detach(p)
+
+
+
+when isMainModule:
+  import os
+
+  let pid: Pid = parseInt(paramStr(1))
+
+  let map = getLinkMap(pid)
+  getSymInfo(pid, map)
+
+  echo findSym(pid, map, "frame_dummy")
